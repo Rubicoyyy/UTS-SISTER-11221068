@@ -1,17 +1,22 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Union
 import asyncio
 import uvicorn
 import time
 import logging
-from .dedup import DedupStore
+from .dedup import DedupStore  # Pastikan Anda punya file ini di src/dedup.py
+from contextlib import asynccontextmanager
 
+# --- Konfigurasi Logging ---
 logger = logging.getLogger("aggregator")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-
+# --- Model Data Pydantic ---
 class EventModel(BaseModel):
     topic: str
     event_id: str
@@ -19,10 +24,11 @@ class EventModel(BaseModel):
     source: str
     payload: Dict[str, Any]
 
-
+# --- Fungsi Pabrik Aplikasi (Factory Function) ---
 def create_app(db_path: str = "./data/dedup.db"):
-    app = FastAPI()
+    app = FastAPI(title="UTS Log Aggregator")
 
+    # --- Middleware untuk CORS (opsional tapi baik untuk pengembangan) ---
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -31,6 +37,7 @@ def create_app(db_path: str = "./data/dedup.db"):
         allow_headers=["*"],
     )
 
+    # --- Inisialisasi State Aplikasi ---
     app.state.start_time = time.time()
     app.state.queue = asyncio.Queue()
     app.state.store = DedupStore(db_path)
@@ -40,98 +47,114 @@ def create_app(db_path: str = "./data/dedup.db"):
         "duplicate_dropped": 0,
     }
 
-    # Use lifespan for startup/shutdown to avoid deprecation warnings
-    from contextlib import asynccontextmanager
-
+    # --- Lifespan Manager untuk Startup dan Shutdown ---
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # startup
+        # --- Proses Startup ---
+        logger.info("🚀 Aplikasi memulai proses startup...")
         app.state.store.init_db()
-        app.state._consumer_shutdown = asyncio.Event()
         app.state.consumer_task = asyncio.create_task(consumer_loop(app))
+        logger.info("✅ Consumer worker telah dimulai.")
+        
+        yield  # Aplikasi berjalan di sini
+        
+        # --- Proses Shutdown ---
+        logger.info("👋 Aplikasi memulai proses shutdown...")
+        app.state.consumer_task.cancel()
         try:
-            yield
-        finally:
-            # shutdown
-            app.state.consumer_task.cancel()
-            try:
-                await app.state.consumer_task
-            except asyncio.CancelledError:
-                pass
-            app.state.store.close()
+            await app.state.consumer_task
+        except asyncio.CancelledError:
+            logger.info("Consumer worker berhasil dihentikan.")
+        app.state.store.close()
+        logger.info(" koneksi database ditutup.")
 
     app.router.lifespan_context = lifespan
 
-    @app.post("/publish")
+    # --- Endpoint API ---
+    
+    # PERBAIKAN 1: Menambahkan status_code=202 Accepted
+    @app.post("/publish", status_code=202)
     async def publish(request: Request):
-        """Accept either a single event JSON or a list of events."""
+        """Menerima satu atau batch event JSON dan memasukkannya ke antrian."""
         try:
             body = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
+            raise HTTPException(status_code=400, detail="Invalid JSON format")
 
-        events = []
+        events_to_process = []
         if isinstance(body, dict):
-            events = [body]
+            events_to_process = [body]
         elif isinstance(body, list):
-            events = body
+            events_to_process = body
         else:
-            raise HTTPException(status_code=400, detail="JSON must be object or array")
+            raise HTTPException(status_code=400, detail="JSON must be a single object or an array of objects")
 
-        accepted = 0
-        for raw in events:
+        accepted_count = 0
+        for raw_event in events_to_process:
             try:
-                ev = EventModel(**raw)
-            except Exception as e:
-                raise HTTPException(status_code=422, detail=str(e))
-            # enqueue for async processing
-            # use Pydantic v2 model_dump to avoid deprecation warnings
-            await app.state.queue.put(ev.model_dump())
-            accepted += 1
+                event_model = EventModel(**raw_event)
+                # Gunakan model_dump() untuk Pydantic v2
+                await app.state.queue.put(event_model.model_dump())
+                
+                # PERBAIKAN 2: Counter 'received' diinkremen di sini saat diterima
+                app.state.counters["received"] += 1
+                
+                accepted_count += 1
+            except ValidationError as e:
+                # Jika validasi gagal, hentikan proses dan kembalikan error
+                raise HTTPException(status_code=422, detail=f"Schema validation error: {e}")
 
-        return {"accepted": accepted}
+        return {"message": f"{accepted_count} event(s) were accepted into the queue."}
 
     @app.get("/events")
     async def get_events(topic: Optional[str] = None):
+        """Mengambil semua event yang unik, bisa difilter berdasarkan topik."""
         rows = app.state.store.list_events(topic)
         return rows
 
     @app.get("/stats")
     async def get_stats():
+        """Menampilkan statistik operasional sistem."""
         uptime = time.time() - app.state.start_time
         stats = {
             "received": app.state.counters["received"],
             "unique_processed": app.state.counters["unique_processed"],
             "duplicate_dropped": app.state.counters["duplicate_dropped"],
             "topics": app.state.store.list_topics(),
-            "uptime_seconds": int(uptime),
+            "uptime_seconds": round(uptime, 2),
         }
         return stats
 
     return app
 
-
-# module-level app for uvicorn import
-app = create_app()
-
-
+# --- Consumer Worker ---
 async def consumer_loop(app: FastAPI):
-    # consumer pulls from queue and processes events, does dedup
+    """Loop tak terbatas yang mengambil event dari antrian dan memprosesnya."""
     while True:
-        ev = await app.state.queue.get()
-        app.state.counters["received"] += 1
         try:
-            is_new = app.state.store.record_event(ev["topic"], ev["event_id"], ev["timestamp"], ev.get("source",""), ev.get("payload",{}))
+            event_data = await app.state.queue.get()
+            
+            is_new = app.state.store.record_event(
+                event_data["topic"],
+                event_data["event_id"],
+                event_data["timestamp"],
+                event_data.get("source", ""),
+                event_data.get("payload", {})
+            )
+            
             if not is_new:
                 app.state.counters["duplicate_dropped"] += 1
-                logger.info(f"Duplicate detected: {ev['topic']}|{ev['event_id']}")
+                logger.info(f"💡 Duplicate dropped: {event_data['topic']}|{event_data['event_id']}")
             else:
                 app.state.counters["unique_processed"] += 1
-                # simulate processing
-                logger.info(f"Processed: {ev['topic']}|{ev['event_id']}")
+                logger.info(f"✅ Processed unique event: {event_data['topic']}|{event_data['event_id']}")
+            
+            app.state.queue.task_done()
         except Exception as e:
-            logger.exception("Error processing event: %s", e)
+            logger.exception(f"Error processing event: {e}")
 
+# --- Inisialisasi utama untuk Uvicorn ---
+app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8080, reload=True)

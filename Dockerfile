@@ -1,47 +1,30 @@
-<<<<<<< HEAD
+# Gunakan base image python yang ramping (slim)
 FROM python:3.11-slim
+
+# Set working directory di dalam container
 WORKDIR /app
 
-# create non-root user early
+# Buat user non-root untuk keamanan
 RUN adduser --disabled-password --gecos '' appuser
 
-# install dependencies as root
+# Salin file dependensi terlebih dahulu untuk memanfaatkan Docker layer caching
 COPY requirements.txt ./
+
+# Install dependensi sebagai root
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy application files
+# Salin kode aplikasi.
+# Jika ada folder lain seperti 'scripts', salin juga.
 COPY src/ ./src/
-COPY scripts/ ./scripts/
+# Contoh: COPY scripts/ ./scripts/
 
-# create data dir and ensure ownership for non-root user
-RUN mkdir -p /app/data /app/scripts && chown -R appuser:appuser /app
+# Buat direktori data dan pastikan kepemilikan untuk non-root user
+RUN mkdir -p /app/data && chown -R appuser:appuser /app
 
-# switch to non-root user
+# Ganti ke user non-root
 USER appuser
 
+# Buka port yang akan digunakan oleh aplikasi
 EXPOSE 8080
-CMD ["python", "-m", "src.main"]
-=======
-FROM python:3.11-slim
-WORKDIR /app
 
-# create non-root user early
-RUN adduser --disabled-password --gecos '' appuser
-
-# install dependencies as root
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-
-# copy application files
-COPY src/ ./src/
-COPY scripts/ ./scripts/
-
-# create data dir and ensure ownership for non-root user
-RUN mkdir -p /app/data /app/scripts && chown -R appuser:appuser /app
-
-# switch to non-root user
-USER appuser
-
-EXPOSE 8080
-CMD ["python", "-m", "src.main"]
->>>>>>> e4351704fe02966e0cd5fc5b126a3a6392a5e648
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,13 +1,5 @@
-<<<<<<< HEAD
 fastapi
 uvicorn[standard]
 pytest
 httpx
 requests
-=======
-fastapi
-uvicorn[standard]
-pytest
-httpx
-requests
->>>>>>> e4351704fe02966e0cd5fc5b126a3a6392a5e648
