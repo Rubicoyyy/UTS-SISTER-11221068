@@ -69,4 +69,4 @@ Gunakan metode ini jika Anda hanya ingin menjalankan layanan `aggregator` dan me
 
 Berikut adalah link ke video demonstrasi sistem yang berjalan:
 
-**[]**
+**[https://youtu.be/yWEU48rka2M]**
