@@ -1,6 +1,10 @@
 # Laporan Desain: Sistem Log Aggregator UTS Sistem Terdistribusi
 
-Laporan ini menguraikan desain dan implementasi layanan *log aggregator* sebagai bagian dari Ujian Tengah Semester (UTS) mata kuliah Sistem Paralel dan Terdistribusi. Sistem ini dibangun menggunakan Python dengan kerangka kerja FastAPI dan dikemas menggunakan Docker.
+Nama : Syahrubi Alam Bahari
+NIM : 11221068
+Kelas : Sistem Paralel dan terdistribusi B
+
+Laporan ini saya buat untuk menguraikan desain dan implementasi layanan *log aggregator* sebagai bagian dari Ujian Tengah Semester (UTS) mata kuliah Sistem Paralel dan Terdistribusi. Sistem ini dibangun menggunakan Python dengan kerangka kerja FastAPI dan dikemas menggunakan Docker.
 
 ## 1. Arsitektur Sistem
 
