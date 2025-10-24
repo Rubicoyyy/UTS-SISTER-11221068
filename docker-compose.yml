@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 version: '3.8'
 services:
   aggregator:
@@ -17,3 +18,24 @@ services:
 
 volumes:
   data:
+=======
+version: '3.8'
+services:
+  aggregator:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - data:/app/data
+
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-u", "scripts/publisher.py", "--url", "http://aggregator:8080/publish", "--count", "5000", "--dup_ratio", "0.2", "--batch_size", "200"]
+    depends_on:
+      - aggregator
+
+volumes:
+  data:
+>>>>>>> e4351704fe02966e0cd5fc5b126a3a6392a5e648
