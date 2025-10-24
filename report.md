@@ -1,453 +1,115 @@
-<<<<<<< HEAD
-# UTS Aggregator — Report
+# Laporan Desain: Sistem Log Aggregator UTS Sistem Terdistribusi
 
-Tanggal: 24 Oktober 2025
+Laporan ini menguraikan desain dan implementasi layanan *log aggregator* sebagai bagian dari Ujian Tengah Semester (UTS) mata kuliah Sistem Paralel dan Terdistribusi. Sistem ini dibangun menggunakan Python dengan kerangka kerja FastAPI dan dikemas menggunakan Docker.
 
-Versi: 1.0
+## 1. Arsitektur Sistem
 
-Ringkasan singkat
------------------
-Laporan ini menjelaskan desain dan implementasi UTS Aggregator, layanan pengumpul event berbasis Python (FastAPI) dengan deduplikasi lokal (SQLite) dan consumer asynchronous. Tujuan utama: menjamin idempotency (satu event diproses sekali), durability terhadap restart (dedup state persist), serta kemampuan menahan duplicate deliveries (simulasi at-least-once delivery).
-
-Bab 1 — Latar Belakang & Tujuan
---------------------------------
-Modern microservice sering menerima event dari banyak publisher, termasuk pengiriman ulang (retries) yang menyebabkan duplicate deliveries. Aggregator ini dibuat untuk:
-
-- Menyediakan endpoint ingestion (HTTP POST) yang menerima single atau batch event.
-- Mencegah pemrosesan ganda berdasarkan (topic, event_id) (deduplication & idempotency).
-- Menyimpan dedup state lokal yang tahan terhadap restart (SQLite).
-- Memberikan statistik dasar dan daftar event yang sudah diproses.
-
-Bab 2 — Spesifikasi Event & API
---------------------------------
-Event JSON minimal:
-
-{
-  "topic": "string",
-  "event_id": "string-unik",
-  "timestamp": "ISO8601",
-  "source": "string",
-  "payload": { ... }
-}
-
-API:
-- POST /publish — menerima single object atau array. Memvalidasi schema menggunakan Pydantic.
-- GET /events?topic=... — mengembalikan daftar event unik yang telah diproses.
-- GET /stats — mengembalikan counters: received, unique_processed, duplicate_dropped, topics, uptime_seconds.
-
-Bab 3 — Desain Sistem
----------------------
-Arsitektur tingkat tinggi:
-
-- FastAPI HTTP server — menerima request POST /publish.
-- In-memory queue (asyncio.Queue) — menyimpan event sebelum diproses.
-- Consumer asinkron — loop yang membaca queue dan melakukan operation dedup + pemrosesan.
-- DedupStore (SQLite) — tabel events dengan PRIMARY KEY (topic, event_id). Insert yang gagal karena PK duplicate menandakan duplicate.
-
-Alasan desain:
-- SQLite dipilih karena sederhana, local-only, dan persisten ke filesystem — memenuhi syarat "tahan restart" tanpa layanan eksternal.
-- In-memory queue sederhana cukup untuk skenario pengujian; untuk produksi dengan ordering/throughput strict, gunakan broker (Kafka, RabbitMQ) dan per-partition ordering.
-
-Bab 4 — Idempotency & Deduplication
------------------------------------
-Implementasi:
-
-- Saat consumer memproses sebuah event, ia mencoba melakukan INSERT ke tabel `events` (topic,event_id,timestamp,source,payload). Jika insert sukses, event dianggap new dan diproses. Jika terjadi sqlite3.IntegrityError (duplicate PK), maka event dianggap duplikat dan tidak diproses ulang.
-- Semua duplicate dicatat di log.
-
-Persistensi:
-- Database SQLite disimpan di `./data/dedup.db` (di dalam container jika dijalankan di Docker). Dengan volume Docker yang tepat, file ini bertahan antar restart container sehingga dedup tetap berlaku.
-
-Bab 5 — Reliability, Ordering & Crash Tolerance
-------------------------------------------------
-Reliability:
-- At-least-once delivery di-simulasikan oleh publisher (dapat mengirim event yang sama berkali-kali). Karena dedup, processing bersifat idempotent.
-- Consumer sederhana: jika consumer crash saat memproses sebelum insert commit, event belum tercatat dan dapat diproses ulang (menjamin at-least-once). Untuk exactly-once memerlukan sink yang mendukung transactional processing end-to-end.
-
-Ordering:
-- Saat ini, aggregator tidak menjamin total ordering. Event diproses oleh satu consumer yang membaca dari satu in-memory FIFO queue; karena publisher dapat mem-batch atau mengirim paralel, urutan relatif dapat tidak konsisten antar waktu.
-- Apakah total ordering dibutuhkan? Itu bergantung use-case:
-  - Jika aplikasi downstream membutuhkan ordering per-topic, perlu implementasi per-topic queueing/partitioning dan pemrosesan sekuensial per partition.
-  - Jika hanya dedup diperlukan tanpa ordering ketat, desain sekarang cukup.
-
-Bab 6 — Pengujian & Hasil
--------------------------
-Unit tests (pytest) yang disertakan:
-
-1. test_dedup_basic — verifikasi dedup insert & duplicate detection.
-2. test_persistence — simulasikan restart dengan membuka kembali DedupStore; memastikan duplikat masih terdeteksi.
-3. test_schema_and_stats — publish via HTTP dan cek /events dan /stats konsisten.
-4. test_small_stress — masukkan 1000 record ke store (dengan banyak duplikasi) dan pastikan selesai dalam batas waktu wajar (<5s pada dev machine saya).
-5. test_batch_publish_and_stats — publish batch 200 events dengan ~20% duplikasi, cek stats konsisten.
-
-Hasil:
-- Semua 5 tests lulus pada mesin pengembang (Windows, Python 3.11). Test run: 5 passed, beberapa Pydantic deprecation warnings (ev.dict() — dapat diupgrade ke model_dump()).
-
-Stress & performance:
-- Untuk skala >=5000 events (permintaan tugas), terdapat script `scripts/publisher.py` yang dapat mengirim 5000 events dengan duplicate ratio 0.2 ke endpoint aggregator (via docker-compose atau lokal). Ini alat untuk mengukur responsivitas. Saya menyiapkan `docker-compose.yml` agar menjalankan aggregator + publisher demo; Anda dapat menjalankan `docker-compose up --build` untuk simulasi.
-
-Bab 7 — Deployment, Operasi & Instruksi
---------------------------------------
-Cara build image Docker:
+Sistem ini dirancang dengan arsitektur *multi-tier* logis yang berjalan di dalam satu layanan, meniru pola *Publish-Subscribe* secara internal untuk mencapai *loose coupling* dan responsivitas.
 
 ```
-docker build -t uts-aggregator .
+       Klien (Publisher Script / curl)
+                    |
+                    | HTTP POST
+                    v
++-------------------------------------------+
+|           Layanan Aggregator              |
+|                                           |
+|  +------------------+   Enqueue   +-----------+
+|  | Endpoint /publish| ----------> | asyncio   |
+|  |   (FastAPI)      |             |  Queue    |
+|  +------------------+             +-----------+
+|                                         | Dequeue
+|                                         v
+|                                 +-----------+
+|                                 | Consumer  |
+|                                 |  Worker   |
+|                                 +-----------+
+|                                      | |
+|       +------------------------------+ +---------------------------+
+|       |                                                            |
+|       v                                                            v
+| +-----------------+  INSERT/SELECT                           +-------------------+
+| | Deduplication   |                                          | Event Store       |
+| | Store (SQLite)  | <-- (Persisten di Docker Volume)         | (Python Dict)     |
+| +-----------------+                                          +-------------------+
+|       ^                                                            ^
+|       | SELECT                                                     | GET
+|       |                                                            |
+|  +------------------+                                        +-------------------+
+|  | Endpoint /stats  | <---------------------------------------| Endpoint /events  |
+|  +------------------+                                        +-------------------+
+|                                                                    |
++-------------------------------------------+                        | HTTP GET
+                                                                     v
+                                                                   Klien
 ```
 
-Run container:
+* **API Layer (Pintu Masuk)**: *Endpoint* `POST /publish` bertindak sebagai pintu masuk. Tugas utamanya adalah memvalidasi skema *event* dan memasukkannya ke dalam antrian internal secepat mungkin, lalu merespons klien dengan status `2022 Accepted`.
+* **Processing Layer (Pekerja Latar Belakang)**: Sebuah *background task* (`consumer_loop`) berjalan secara asinkron, bertindak sebagai *consumer*. Ia mengambil *event* dari antrian, melakukan logika bisnis inti (deduplikasi), dan memperbarui *state* sistem.
+* **Data Layer (Penyimpanan)**: Terdiri dari dua komponen:
+    * **Deduplication Store**: Database **SQLite** yang persisten, disimpan di dalam *Docker volume*. Fungsinya adalah mencatat kombinasi unik `(topic, event_id)` yang sudah diproses untuk mencegah pemrosesan ulang.
+    * **Event Store**: Database SQLite yang sama juga digunakan untuk menyimpan detail *event* unik yang akan disajikan melalui `GET /events`.
 
-```
-docker run -p 8080:8080 uts-aggregator
-```
+## 2. Keterkaitan dengan Teori Sistem Terdistribusi
 
-Docker Compose (demo load-generator):
+### T1 (Bab 1): Karakteristik dan Trade-off
 
-```
-docker-compose up --build
-```
+Sistem aggregator ini menunjukkan beberapa karakteristik sistem terdistribusi. [cite_start]**Pembagian sumber daya** (*resource sharing*) terlihat dari bagaimana API dapat diakses secara bersamaan oleh banyak klien (Bab 1, hlm. 10)[cite: 95]. [cite_start]**Keterbukaan** (*openness*) diimplementasikan melalui penggunaan standar industri seperti HTTP dan JSON untuk komunikasi, memungkinkan klien dari platform mana pun untuk berinteraksi dengannya (Bab 1, hlm. 15)[cite: 141].
 
-Run lokal tanpa Docker (development):
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
-```
-
-API examples:
-
-Publish single via curl:
-
-```powershell
-curl -X POST http://localhost:8080/publish -H "Content-Type: application/json" -d "{\"topic\":\"t\",\"event_id\":\"e1\",\"timestamp\":\"2025-10-24T00:00:00Z\",\"source\":\"curl\",\"payload\":{}}"
-```
-
-GET events:
-
-```
-GET http://localhost:8080/events?topic=t
-```
-
-GET stats:
-
-```
-GET http://localhost:8080/stats
-```
-
-Analisis Keterbatasan & Rekomendasi Produksi
--------------------------------------------
-- SQLite adalah solusi sederhana dan tepat untuk tugas ini (local-only persistence). Untuk beban produksi tinggi, gunakan WAL mode, tune PRAGMA settings, atau pertimbangkan server-side DB (Postgres) atau distributed log (Kafka) untuk durability dan throughput.
-- Ordering: implementasikan per-topic partitions jika ordering per-topic diperlukan. Gunakan broker yang mendukung ordering semantics.
-- Observability: tambahkan metrics (Prometheus), structured logging, serta tracing untuk troubleshooting.
-
-Referensi
----------
-- FastAPI docs — https://fastapi.tiangolo.com
-- SQLite docs — https://sqlite.org/docs.html
-- Pydantic (model migration notes) — https://errors.pydantic.dev/2.12/migration/
-
-Lampiran: struktur file (ringkas)
-
-- src/main.py — FastAPI app + consumer
-- src/dedup.py — DedupStore (SQLite)
-- scripts/publisher.py — Load generator for testing
-- tests/test_aggregator.py — pytest suite (5 tests)
-- Dockerfile, docker-compose.yml, requirements.txt, README.md
+*Trade-off* utama dalam desain ini adalah antara **kinerja API** dan **konsistensi data**. [cite_start]Dengan memisahkan penerimaan *request* dari pemrosesannya menggunakan `asyncio.Queue`, API dapat merespons dengan sangat cepat (*low latency*), meningkatkan **skalabilitas** (Bab 1, hlm. 24) [cite: 204] dari sisi penerimaan. Namun, konsekuensinya adalah data tidak langsung konsisten; ada jeda waktu sebelum *event* diproses oleh *consumer*. Ini adalah bentuk sederhana dari *eventual consistency*.
 
 ---
-Jika Anda mau, saya bisa:
 
-- Mengubah `ev.dict()` menjadi `ev.model_dump()` untuk menghilangkan Pydantic deprecation warnings (cepat).
-- Menjalankan benchmark 5000 events sekarang dan melaporkan throughput/latency (saya akan gunakan docker-compose atau menjalankan uvicorn lokal + scripts/publisher.py). Perlu konfirmasi apakah Anda mau saya jalankan di mesin ini.
-- Menghasilkan PDF dari `report.md` (butuh konversi lokal atau tool tambahan).
+### T2 (Bab 2): Pilihan Arsitektur
 
-Selesai.
-# Report
+[cite_start]Secara konseptual, arsitektur internal sistem ini meniru pola **Publish-Subscribe** (Bab 2, hlm. 68)[cite: 470].
+* **Publisher**: *Endpoint* `POST /publish`.
+* **Broker**: Antrian `asyncio.Queue`.
+* **Subscriber**: *Background task* `consumer_loop`.
 
-## Desain singkat
-
-Aggregator dibangun sebagai HTTP ingestion (FastAPI) + in-memory queue (asyncio.Queue) + persistent dedup store (SQLite). Tujuan utama: idempotency lokal, tahan restart, dan kemampuan memproses duplicate deliveries.
-
-Komponen:
-- HTTP ingest (POST /publish)
-- Consumer async membaca dari queue dan memanggil `DedupStore.record_event`.
-- DedupStore: SQLite dengan PK (topic,event_id) untuk atomic dedup.
-
-## Idempotency & Durability
-
-- Karena dedup state disimpan di SQLite, setelah restart service tidak akan memproses event yang sama lagi (jika file DB tetap ada).
-- Logging mencatat duplicate detection.
-
-## Ordering
-
-Saat ini aggregator tidak menjamin total ordering. Hanya FIFO pada single queue — namun concurrency internal atau batch producer tidak membuat ordering per-topic terjamin.
-
-Pertimbangan:
-- Jika aplikasi memerlukan ordering per-topic, rekomendasi: implement per-topic partition/queue dan proses sekuensial per-partition.
-- Ganti in-memory queue dengan persistent queue (mis. Kafka/Rabbit) kalau butuh durability/ordering tinggi di production.
-
-## Reliability
-
-- At-least-once delivery: dipenuhi dari sisi publisher (yang dapat mengirim ulang). Dedup memastikan hanya satu pemrosesan untuk identitas event.
-
-## Performance
-
-- Test dasar (unit test stress kecil) menunjukkan operasi SQLite insert dengan banyak duplikasi menyelesaikan 1000 inserts dalam waktu singkat. Untuk beban 5000+ events disarankan menguji menggunakan `scripts/publisher.py` dan docker-compose untuk mensimulasikan traffic.
-
-## Tests
-
-- Tests: 5 tests (dedup basic, persistence, schema+stats, small stress, batch publish+stats). Semua lulus pada mesin developer.
-
-## Instruksi run singkat
-
-Build image:
-
-```
-docker build -t uts-aggregator .
-```
-
-Run container:
-
-```
-docker run -p 8080:8080 uts-aggregator
-```
-
-Docker Compose demo load:
-
-```
-docker-compose up --build
-```
-
-## Catatan & Next steps
-
-- Migrasi ke persistent broker untuk ordering/throughput lebih baik.
-- Tambahkan metrics dan observability.
-
-=======
-# UTS Aggregator — Report
-
-Tanggal: 24 Oktober 2025
-
-Versi: 1.0
-
-Ringkasan singkat
------------------
-Laporan ini menjelaskan desain dan implementasi UTS Aggregator, layanan pengumpul event berbasis Python (FastAPI) dengan deduplikasi lokal (SQLite) dan consumer asynchronous. Tujuan utama: menjamin idempotency (satu event diproses sekali), durability terhadap restart (dedup state persist), serta kemampuan menahan duplicate deliveries (simulasi at-least-once delivery).
-
-Bab 1 — Latar Belakang & Tujuan
---------------------------------
-Modern microservice sering menerima event dari banyak publisher, termasuk pengiriman ulang (retries) yang menyebabkan duplicate deliveries. Aggregator ini dibuat untuk:
-
-- Menyediakan endpoint ingestion (HTTP POST) yang menerima single atau batch event.
-- Mencegah pemrosesan ganda berdasarkan (topic, event_id) (deduplication & idempotency).
-- Menyimpan dedup state lokal yang tahan terhadap restart (SQLite).
-- Memberikan statistik dasar dan daftar event yang sudah diproses.
-
-Bab 2 — Spesifikasi Event & API
---------------------------------
-Event JSON minimal:
-
-{
-  "topic": "string",
-  "event_id": "string-unik",
-  "timestamp": "ISO8601",
-  "source": "string",
-  "payload": { ... }
-}
-
-API:
-- POST /publish — menerima single object atau array. Memvalidasi schema menggunakan Pydantic.
-- GET /events?topic=... — mengembalikan daftar event unik yang telah diproses.
-- GET /stats — mengembalikan counters: received, unique_processed, duplicate_dropped, topics, uptime_seconds.
-
-Bab 3 — Desain Sistem
----------------------
-Arsitektur tingkat tinggi:
-
-- FastAPI HTTP server — menerima request POST /publish.
-- In-memory queue (asyncio.Queue) — menyimpan event sebelum diproses.
-- Consumer asinkron — loop yang membaca queue dan melakukan operation dedup + pemrosesan.
-- DedupStore (SQLite) — tabel events dengan PRIMARY KEY (topic, event_id). Insert yang gagal karena PK duplicate menandakan duplicate.
-
-Alasan desain:
-- SQLite dipilih karena sederhana, local-only, dan persisten ke filesystem — memenuhi syarat "tahan restart" tanpa layanan eksternal.
-- In-memory queue sederhana cukup untuk skenario pengujian; untuk produksi dengan ordering/throughput strict, gunakan broker (Kafka, RabbitMQ) dan per-partition ordering.
-
-Bab 4 — Idempotency & Deduplication
------------------------------------
-Implementasi:
-
-- Saat consumer memproses sebuah event, ia mencoba melakukan INSERT ke tabel `events` (topic,event_id,timestamp,source,payload). Jika insert sukses, event dianggap new dan diproses. Jika terjadi sqlite3.IntegrityError (duplicate PK), maka event dianggap duplikat dan tidak diproses ulang.
-- Semua duplicate dicatat di log.
-
-Persistensi:
-- Database SQLite disimpan di `./data/dedup.db` (di dalam container jika dijalankan di Docker). Dengan volume Docker yang tepat, file ini bertahan antar restart container sehingga dedup tetap berlaku.
-
-Bab 5 — Reliability, Ordering & Crash Tolerance
-------------------------------------------------
-Reliability:
-- At-least-once delivery di-simulasikan oleh publisher (dapat mengirim event yang sama berkali-kali). Karena dedup, processing bersifat idempotent.
-- Consumer sederhana: jika consumer crash saat memproses sebelum insert commit, event belum tercatat dan dapat diproses ulang (menjamin at-least-once). Untuk exactly-once memerlukan sink yang mendukung transactional processing end-to-end.
-
-Ordering:
-- Saat ini, aggregator tidak menjamin total ordering. Event diproses oleh satu consumer yang membaca dari satu in-memory FIFO queue; karena publisher dapat mem-batch atau mengirim paralel, urutan relatif dapat tidak konsisten antar waktu.
-- Apakah total ordering dibutuhkan? Itu bergantung use-case:
-  - Jika aplikasi downstream membutuhkan ordering per-topic, perlu implementasi per-topic queueing/partitioning dan pemrosesan sekuensial per partition.
-  - Jika hanya dedup diperlukan tanpa ordering ketat, desain sekarang cukup.
-
-Bab 6 — Pengujian & Hasil
--------------------------
-Unit tests (pytest) yang disertakan:
-
-1. test_dedup_basic — verifikasi dedup insert & duplicate detection.
-2. test_persistence — simulasikan restart dengan membuka kembali DedupStore; memastikan duplikat masih terdeteksi.
-3. test_schema_and_stats — publish via HTTP dan cek /events dan /stats konsisten.
-4. test_small_stress — masukkan 1000 record ke store (dengan banyak duplikasi) dan pastikan selesai dalam batas waktu wajar (<5s pada dev machine saya).
-5. test_batch_publish_and_stats — publish batch 200 events dengan ~20% duplikasi, cek stats konsisten.
-
-Hasil:
-- Semua 5 tests lulus pada mesin pengembang (Windows, Python 3.11). Test run: 5 passed, beberapa Pydantic deprecation warnings (ev.dict() — dapat diupgrade ke model_dump()).
-
-Stress & performance:
-- Untuk skala >=5000 events (permintaan tugas), terdapat script `scripts/publisher.py` yang dapat mengirim 5000 events dengan duplicate ratio 0.2 ke endpoint aggregator (via docker-compose atau lokal). Ini alat untuk mengukur responsivitas. Saya menyiapkan `docker-compose.yml` agar menjalankan aggregator + publisher demo; Anda dapat menjalankan `docker-compose up --build` untuk simulasi.
-
-Bab 7 — Deployment, Operasi & Instruksi
---------------------------------------
-Cara build image Docker:
-
-```
-docker build -t uts-aggregator .
-```
-
-Run container:
-
-```
-docker run -p 8080:8080 uts-aggregator
-```
-
-Docker Compose (demo load-generator):
-
-```
-docker-compose up --build
-```
-
-Run lokal tanpa Docker (development):
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
-```
-
-API examples:
-
-Publish single via curl:
-
-```powershell
-curl -X POST http://localhost:8080/publish -H "Content-Type: application/json" -d "{\"topic\":\"t\",\"event_id\":\"e1\",\"timestamp\":\"2025-10-24T00:00:00Z\",\"source\":\"curl\",\"payload\":{}}"
-```
-
-GET events:
-
-```
-GET http://localhost:8080/events?topic=t
-```
-
-GET stats:
-
-```
-GET http://localhost:8080/stats
-```
-
-Analisis Keterbatasan & Rekomendasi Produksi
--------------------------------------------
-- SQLite adalah solusi sederhana dan tepat untuk tugas ini (local-only persistence). Untuk beban produksi tinggi, gunakan WAL mode, tune PRAGMA settings, atau pertimbangkan server-side DB (Postgres) atau distributed log (Kafka) untuk durability dan throughput.
-- Ordering: implementasikan per-topic partitions jika ordering per-topic diperlukan. Gunakan broker yang mendukung ordering semantics.
-- Observability: tambahkan metrics (Prometheus), structured logging, serta tracing untuk troubleshooting.
-
-Referensi
----------
-- FastAPI docs — https://fastapi.tiangolo.com
-- SQLite docs — https://sqlite.org/docs.html
-- Pydantic (model migration notes) — https://errors.pydantic.dev/2.12/migration/
-
-Lampiran: struktur file (ringkas)
-
-- src/main.py — FastAPI app + consumer
-- src/dedup.py — DedupStore (SQLite)
-- scripts/publisher.py — Load generator for testing
-- tests/test_aggregator.py — pytest suite (5 tests)
-- Dockerfile, docker-compose.yml, requirements.txt, README.md
+*Publisher* tidak mengetahui detail implementasi *subscriber*; mereka hanya perlu tahu cara "menerbitkan" *event* ke *broker*. Pemisahan ini (*decoupling*) membuat sistem lebih fleksibel. [cite_start]Jika dibandingkan dengan arsitektur *client-server* sinkron yang ketat (Bab 2, hlm. 79) [cite: 23, 718] di mana klien harus menunggu pemrosesan selesai, pendekatan Pub-Sub internal ini jauh lebih unggul untuk *throughput* tinggi.
 
 ---
-Jika Anda mau, saya bisa:
 
-- Mengubah `ev.dict()` menjadi `ev.model_dump()` untuk menghilangkan Pydantic deprecation warnings (cepat).
-- Menjalankan benchmark 5000 events sekarang dan melaporkan throughput/latency (saya akan gunakan docker-compose atau menjalankan uvicorn lokal + scripts/publisher.py). Perlu konfirmasi apakah Anda mau saya jalankan di mesin ini.
-- Menghasilkan PDF dari `report.md` (butuh konversi lokal atau tool tambahan).
+### T3 & T8: Reliability, Idempotency, dan Metrik
 
-Selesai.
-# Report
+Sistem ini dirancang untuk menangani simulasi **at-least-once delivery**, di mana *publisher* dapat mengirim *event* yang sama berkali-kali. [cite_start]Untuk mengatasi ini, *consumer* dirancang agar **idempotent** (Bab 8, hlm. 513)[cite: 1242]. Logika di dalam `DedupStore` (menggunakan `PRIMARY KEY` pada `(topic, event_id)` di SQLite) memastikan bahwa memproses *event* yang sama berulang kali tidak akan mengubah *state* akhir.
 
-## Desain singkat
+Ini secara langsung berdampak pada metrik evaluasi **duplicate rate**, yang dijaga mendekati nol oleh mekanisme ini. Metrik lain seperti **throughput** (jumlah *event* yang dapat diterima per detik) dan **latency** (waktu respons API `/publish`) dijaga tetap baik karena pemrosesan berat (penulisan ke DB) dilakukan secara asinkron.
 
-Aggregator dibangun sebagai HTTP ingestion (FastAPI) + in-memory queue (asyncio.Queue) + persistent dedup store (SQLite). Tujuan utama: idempotency lokal, tahan restart, dan kemampuan memproses duplicate deliveries.
+---
 
-Komponen:
-- HTTP ingest (POST /publish)
-- Consumer async membaca dari queue dan memanggil `DedupStore.record_event`.
-- DedupStore: SQLite dengan PK (topic,event_id) untuk atomic dedup.
+### T4 (Bab 6): Penamaan untuk Deduplikasi
 
-## Idempotency & Durability
+Skema penamaan `(topic, event_id)` digunakan sebagai *identifier* unik untuk setiap *event*. Ini adalah kombinasi dari:
+* [cite_start]**Structured Naming** untuk `topic` (Bab 6, hlm. 344)[cite: 25, 1116], yang memungkinkan pengelompokan dan pemfilteran *event*.
+* [cite_start]**Flat Naming** untuk `event_id` (Bab 6, hlm. 329)[cite: 25, 1096], yang diasumsikan unik dalam konteks topiknya.
 
-- Karena dedup state disimpan di SQLite, setelah restart service tidak akan memproses event yang sama lagi (jika file DB tetap ada).
-- Logging mencatat duplicate detection.
+Kombinasi ini menjadi kunci utama untuk mekanisme deduplikasi. *Consumer* menggunakan kunci komposit ini di database SQLite untuk secara efisien mendeteksi dan membuang duplikat.
 
-## Ordering
+---
 
-Saat ini aggregator tidak menjamin total ordering. Hanya FIFO pada single queue — namun concurrency internal atau batch producer tidak membuat ordering per-topic terjamin.
+### T5 (Bab 5): Ordering
 
-Pertimbangan:
-- Jika aplikasi memerlukan ordering per-topic, rekomendasi: implement per-topic partition/queue dan proses sekuensial per-partition.
-- Ganti in-memory queue dengan persistent queue (mis. Kafka/Rabbit) kalau butuh durability/ordering tinggi di production.
+[cite_start]**Total ordering** (Bab 5, hlm. 264) [cite: 1013] tidak diperlukan dalam konteks aggregator ini. *Event* dari *topic* yang berbeda umumnya independen dan tidak memiliki hubungan kausal. Memaksakan urutan global akan menjadi *bottleneck* yang tidak perlu. Sistem ini memproses *event* berdasarkan urutan kedatangannya di `asyncio.Queue`, yang secara efektif mendekati **FIFO ordering**. Untuk kebutuhan sebagian besar sistem log, urutan ini sudah lebih dari cukup. *Timestamp* dalam *event* dapat digunakan di sisi klien untuk pengurutan *best-effort* jika diperlukan.
 
-## Reliability
+---
 
-- At-least-once delivery: dipenuhi dari sisi publisher (yang dapat mengirim ulang). Dedup memastikan hanya satu pemrosesan untuk identitas event.
+### T6 (Bab 8): Failure Modes dan Toleransi Crash
 
-## Performance
+[cite_start]Mode kegagalan utama yang ditangani oleh desain ini adalah **crash failure** (Bab 8, hlm. 467) [cite: 28, 1234] pada layanan aggregator. **Toleransi crash** diimplementasikan melalui strategi mitigasi berikut:
+* **Durable Dedup Store**: *State* deduplikasi (ID *event* yang sudah diproses) disimpan dalam file SQLite.
+* **Docker Volume**: File SQLite ini ditempatkan di dalam *Docker volume*, yang memastikan data tersebut **persisten** dan tidak hilang saat *container* berhenti atau *restart*.
 
-- Test dasar (unit test stress kecil) menunjukkan operasi SQLite insert dengan banyak duplikasi menyelesaikan 1000 inserts dalam waktu singkat. Untuk beban 5000+ events disarankan menguji menggunakan `scripts/publisher.py` dan docker-compose untuk mensimulasikan traffic.
+Ketika layanan dimulai kembali, ia akan memuat ulang *database* dari *volume*, sehingga ia "mengingat" semua *event* yang telah diproses sebelumnya dan dapat melanjutkan proses deduplikasi tanpa kesalahan. Ini mencegah pemrosesan ulang (*reprocessing*) yang bisa menyebabkan duplikasi data.
 
-## Tests
+---
 
-- Tests: 5 tests (dedup basic, persistence, schema+stats, small stress, batch publish+stats). Semua lulus pada mesin developer.
+### T7 (Bab 7): Konsistensi
 
-## Instruksi run singkat
+[cite_start]Sistem ini secara eksplisit mengadopsi model **eventual consistency** (Bab 7, hlm. 407)[cite: 25, 1174]. Ketika API `/publish` merespons klien, tidak ada jaminan bahwa *event* tersebut sudah langsung terlihat di `GET /events`. Ada jeda waktu (*replication lag*) yang dibutuhkan oleh *consumer* untuk mengambil *event* dari antrian dan menyimpannya ke database. Namun, sistem menjamin bahwa jika tidak ada *event* baru yang masuk, pada akhirnya semua *event* unik yang telah diterima akan diproses dan disimpan. Mekanisme **idempotency** dan **deduplikasi** adalah fondasi yang memungkinkan sistem mencapai keadaan akhir yang konsisten meskipun ada pengiriman *event* yang berulang.
 
-Build image:
+---
+### Sitasi
 
-```
-docker build -t uts-aggregator .
-```
-
-Run container:
-
-```
-docker run -p 8080:8080 uts-aggregator
-```
-
-Docker Compose demo load:
-
-```
-docker-compose up --build
-```
-
-## Catatan & Next steps
-
-- Migrasi ke persistent broker untuk ordering/throughput lebih baik.
-- Tambahkan metrics dan observability.
-
->>>>>>> e4351704fe02966e0cd5fc5b126a3a6392a5e648
+van Steen, M., & Tanenbaum, A. S. (2023). *Distributed Systems*. Maarten van Steen.
