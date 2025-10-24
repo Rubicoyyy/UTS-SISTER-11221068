@@ -21,6 +21,41 @@ python -m venv .venv
 .\.venv\Scripts\python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
 ```
 
+Activate virtualenv (PowerShell)
+
+If Activate.ps1 is blocked by PowerShell's execution policy, use a per-session (temporary) bypass — this does NOT change system settings:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+& .\.venv\Scripts\Activate.ps1
+```
+
+Single-line child PowerShell alternative (runs one child process with bypass):
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -Command "& '.\\.venv\\Scripts\\Activate.ps1'"
+```
+
+There is also a small helper script included in this repository to make activation easier from the project root:
+
+```powershell
+# From project root
+powershell -ExecutionPolicy Bypass -File tools\activate_venv.ps1
+# or (if your policy already permits running the helper)
+& .\tools\activate_venv.ps1
+```
+
+Persistent change (only if you understand the security tradeoffs):
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Notes:
+- The per-process options are the safest for development: they don't modify user or machine policy.
+- `RemoteSigned` allows local scripts but requires downloaded scripts to be signed.
+- If you are on a managed machine (corporate), check with your admin before changing policies.
+
 2) Publish example (single):
 
 ```powershell
